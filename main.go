@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/beevik/etree"
@@ -15,9 +16,15 @@ var outdirflag = flag.String("outdir", "", "Output directory for posts")
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var entlimitflag = flag.Int("entlim", 0, "Stop after processing N entries (debugging)")
 
+type bentry struct {
+	year, month int
+	title       string
+	pubdate     time.Time
+	elem        *etree.Element
+}
+
 type state struct {
-	entries  []*etree.Element
-	pubdates []time.Time
+	bentries []bentry
 }
 
 func readxml(path string) (*etree.Document, error) {
@@ -32,31 +39,45 @@ func convertpost(entry *etree.Element) error {
 	return nil
 }
 
-func (s *state) walkxml(root *etree.Document) error {
-	for feeds := range root.SelectElementsSeq("feed") {
-		for ent := range feeds.SelectElementsSeq("entry") {
-			fmt.Println("CHILD element:", ent.Tag)
-			if title := ent.SelectElement("title"); title != nil {
-				lang := title.SelectAttrValue("lang", "unknown")
-				fmt.Printf("  TITLE: %s (%s)\n", title.Text(), lang)
-			}
-			if id := ent.SelectElement("id"); id != nil {
-				fmt.Printf("  ID: %s\n", id.Text())
-			}
-			s.entries = append(s.entries, ent)
-			if *entlimitflag != 0 && len(s.entries) >= *entlimitflag {
-				verb(0, "note: stopped appending entries at %d count", *entlimitflag)
-				break
-			}
-			panic("do this stuff below")
-			// locate publication date
-			// collect blogger:filename and set correct slug (year, month, title fragment)
+func (s *state) addEntry(elem *etree.Element) error {
+
+	var b bentry
+	b.elem = elem
+
+	// locate and parse publication date. we expect a format something like
+	// <published>2009-06-01T12:13:00.003Z</published>
+	if published := elem.SelectElement("published"); published != nil {
+		txt := published.Text()
+		verb(1, "entry pubdate: %s", txt)
+		t, err := time.Parse(time.RFC3339, txt)
+		if err != nil {
+			return fmt.Errorf("parsing pubdate: %v", err)
 		}
+		b.pubdate = t
+	} else {
+		return fmt.Errorf("entry contains no publication date/time")
 	}
+
+	// collect blogger:filename and set correct slug (year, month, title fragment)
+	if bfn := elem.SelectElement("blogger:filename"); bfn != nil {
+		txt := bfn.Text()
+		verb(1, "blogger:filename: %s", txt)
+		// expected format: <blogger:filename>/2014/11/braces-off.html</blogger:filename>
+		if n, err := fmt.Sscanf(txt, "/%d/%d/%s", &b.year, &b.month, &b.title); err != nil {
+			return fmt.Errorf("unexpected blogger:filename entry %q", txt)
+		} else if n != 3 {
+			return fmt.Errorf("unexpected partial blogger:filename entry %q", txt)
+		}
+	} else {
+		return fmt.Errorf("entry contains no blogger:filename entry")
+	}
+
+	s.bentries = append(s.bentries, b)
+
 	return nil
 }
 
-func (s *state) emitEntry() error {
+func (s *state) emitEntry(ent bentry) error {
 	// collect categories
 	// note: explore using hugo taxonomies
 	// walk content, converting to markdown
@@ -64,11 +85,54 @@ func (s *state) emitEntry() error {
 }
 
 func (s *state) emit() error {
-	for _, ent := range s.entries {
+	for _, ent := range s.bentries {
 		if err := s.emitEntry(ent); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+func (s *state) walkxml(root *etree.Document) error {
+
+	// Collect blog post entries.
+	for feeds := range root.SelectElementsSeq("feed") {
+		for ent := range feeds.SelectElementsSeq("entry") {
+			if bt := ent.SelectElement("blogger:type"); bt != nil {
+				btt := bt.Text()
+				if btt != "POST" {
+					verb(1, "ignoring %s entry", btt)
+					continue
+				}
+			}
+			if err := s.addEntry(ent); err != nil {
+				return err
+			}
+			if *entlimitflag != 0 && len(s.bentries) >= *entlimitflag {
+				verb(0, "note: stopped appending entries at %d count", *entlimitflag)
+				break
+			}
+		}
+	}
+
+	// Sort entries based on publication date.
+	sort.Slice(s.bentries, func(i, j int) bool {
+		bi := &s.bentries[i]
+		bj := &s.bentries[j]
+		if bi.pubdate != bj.pubdate {
+			return bi.pubdate.Compare(bj.pubdate) < 0
+		}
+		return bi.title < bj.title
+	})
+
+	if *verbflag != 0 {
+		verb(1, "entries:")
+		for i := range s.bentries {
+			b := s.bentries[i]
+			verb(1, "%d: %d/%d pd=%v %q", i, b.year, b.month, b.pubdate, b.title)
+		}
+	}
+
 	return nil
 }
 
