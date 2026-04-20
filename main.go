@@ -6,10 +6,18 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/beevik/etree"
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 )
+
+// Todo list
+// - create output filename based on slug/year/day, write text to it
+// - front matter for markdown post (title etc)
+// - augment test harness to run hugo
 
 var infileflag = flag.String("infile", "", "Input XML file")
 var outdirflag = flag.String("outdir", "", "Output directory for posts")
@@ -35,7 +43,116 @@ func readxml(path string) (*etree.Document, error) {
 	return doc, nil
 }
 
-func convertpost(entry *etree.Element) error {
+type hvisitor struct {
+	spanstack []string
+	md        strings.Builder
+}
+
+func (hv *hvisitor) pre(n *html.Node, level int) error {
+	verb(1, "pre: lev=%d nodetype %s atom: %v", level, n.Type, n.DataAtom)
+	switch n.Type {
+	case html.TextNode:
+		verb(1, " %q", n.Data)
+		// QQ do we need to worry about escaping here?
+		hv.md.WriteString(n.Data)
+	case html.ElementNode:
+		switch n.DataAtom {
+		case atom.B:
+			hv.md.WriteString("**")
+		case atom.Br:
+			hv.md.WriteString("\n")
+		case atom.Div:
+			// not supported yet
+		case atom.Span:
+			// ex: <span style="font-weight:bold;">foobar</span>
+			for _, a := range n.Attr {
+				if a.Key == "style" && a.Val == "font-weight:bold" {
+					hv.md.WriteString("**")
+					break
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (hv *hvisitor) post(n *html.Node, level int) error {
+	verb(1, "post: lev=%d nodetype %s atom: %v", level, n.Type, n.DataAtom)
+	if n.Type == html.ElementNode {
+		switch n.DataAtom {
+		case atom.B:
+			hv.md.WriteString("**")
+		case atom.Div:
+			// not supported yet
+		case atom.Span:
+			// ex: <span style="font-weight:bold;">foobar</span>
+			for _, a := range n.Attr {
+				if a.Key == "style" && a.Val == "font-weight:bold" {
+					hv.md.WriteString("**")
+					break
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (hv *hvisitor) visitHtmlNode(n *html.Node, level int) {
+	hv.pre(n, level)
+	if n.FirstChild != nil {
+		hv.visitHtmlNode(n.FirstChild, level+1)
+	}
+	if n.NextSibling != nil {
+		hv.visitHtmlNode(n.NextSibling, level)
+	}
+	hv.post(n, level)
+}
+
+func convertPost(ent bentry) (cerr error) {
+
+	// Grab post content.
+	var content string
+	if celem := ent.elem.SelectElement("content"); celem == nil {
+		return fmt.Errorf("entry lacks content element")
+	} else {
+		content = celem.Text()
+	}
+
+	// Kick off HTML parse of content.
+	doc, err := html.Parse(strings.NewReader(content))
+	if err != nil {
+		return fmt.Errorf("html.Parse failed: %v", err)
+	}
+	verb(1, "converting post: %d/%d %s", ent.year, ent.month, ent.title)
+
+	// Generate head matter.
+	v := &hvisitor{}
+	fmt.Fprintf(&v.md, "---\n")
+	fmt.Fprintf(&v.md, "title: \"%s\"\n", ent.title)
+	fmt.Fprintf(&v.md, "date: %v\n", ent.pubdate)
+	fmt.Fprintf(&v.md, "---\n\n")
+
+	// Walk tree.
+	v.visitHtmlNode(doc, 0)
+
+	// Open output file.
+	fn := fmt.Sprintf("%s/post_y%d_m%d.md", *outdirflag, ent.month, ent.year)
+	outf, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("opening %s: %v", fn, err)
+	}
+
+	closer := func() {
+		if err := outf.Close(); err != nil {
+			cerr = fmt.Errorf("closing %s: %v", fn, err)
+		}
+	}
+	defer closer()
+
+	// Write markdown
+	if _, err := fmt.Fprintf(outf, "%s\n", v.md.String()); err != nil {
+		return fmt.Errorf("writing to %s: %v", fn, err)
+	}
 	return nil
 }
 
@@ -63,7 +180,7 @@ func (s *state) addEntry(elem *etree.Element) error {
 		txt := bfn.Text()
 		verb(1, "blogger:filename: %s", txt)
 		// expected format: <blogger:filename>/2014/11/braces-off.html</blogger:filename>
-		if n, err := fmt.Sscanf(txt, "/%d/%d/%s", &b.year, &b.month, &b.title); err != nil {
+		if n, err := fmt.Sscanf(txt, "/%d/%d/%s", &b.month, &b.year, &b.title); err != nil {
 			return fmt.Errorf("unexpected blogger:filename entry %q", txt)
 		} else if n != 3 {
 			return fmt.Errorf("unexpected partial blogger:filename entry %q", txt)
@@ -81,6 +198,9 @@ func (s *state) emitEntry(ent bentry) error {
 	// collect categories
 	// note: explore using hugo taxonomies
 	// walk content, converting to markdown
+	if err := convertPost(ent); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -98,10 +218,19 @@ func (s *state) walkxml(root *etree.Document) error {
 	// Collect blog post entries.
 	for feeds := range root.SelectElementsSeq("feed") {
 		for ent := range feeds.SelectElementsSeq("entry") {
+			// skip things that are not posts
 			if bt := ent.SelectElement("blogger:type"); bt != nil {
 				btt := bt.Text()
 				if btt != "POST" {
 					verb(1, "ignoring %s entry", btt)
+					continue
+				}
+			}
+			// skip drafts for now
+			if bs := ent.SelectElement("blogger:status"); bs != nil {
+				bst := bs.Text()
+				if bst != "LIVE" {
+					verb(1, "ignoring blog with status %s", bst)
 					continue
 				}
 			}
