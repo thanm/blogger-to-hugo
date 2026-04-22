@@ -26,8 +26,10 @@ var entlimitflag = flag.Int("entlim", 0, "Stop after processing N entries (debug
 
 type bentry struct {
 	year, month int
+	urlfrag     string
 	title       string
 	pubdate     time.Time
+	tags        []string
 	elem        *etree.Element
 }
 
@@ -46,6 +48,30 @@ func readxml(path string) (*etree.Document, error) {
 type hvisitor struct {
 	spanstack []string
 	md        strings.Builder
+	uatoms    map[atom.Atom]struct{}
+	uspanats  map[string]struct{}
+}
+
+func mkhvisitor() *hvisitor {
+	return &hvisitor{
+		uatoms:   make(map[atom.Atom]struct{}),
+		uspanats: make(map[string]struct{}),
+	}
+}
+
+func (hv *hvisitor) unsupportedAtom(a atom.Atom) {
+	if _, ok := hv.uatoms[a]; !ok {
+		verb(1, " => unsupported atom ignored: %v", a)
+		hv.uatoms[a] = struct{}{}
+	}
+}
+
+func (hv *hvisitor) unsupportedSpanAttr(key, val string) {
+	k := key + " -> " + val
+	if _, ok := hv.uspanats[k]; !ok {
+		verb(1, " => unsupported span attr ignored: %q", k)
+		hv.uspanats[k] = struct{}{}
+	}
 }
 
 func (hv *hvisitor) pre(n *html.Node, level int) error {
@@ -61,17 +87,22 @@ func (hv *hvisitor) pre(n *html.Node, level int) error {
 			hv.md.WriteString("**")
 		case atom.Br:
 			hv.md.WriteString("\n")
-		case atom.Div:
-			// not supported yet
+		//case atom.Div: not supported yet
 		case atom.Span:
 			// ex: <span style="font-weight:bold;">foobar</span>
 			for _, a := range n.Attr {
+				found := false
 				if a.Key == "style" && a.Val == "font-weight:bold" {
 					hv.md.WriteString("**")
-					break
+					found = true
+				}
+				if !found {
+					hv.unsupportedSpanAttr(a.Key, a.Val)
 				}
 			}
 		}
+	default:
+		hv.unsupportedAtom(n.DataAtom)
 	}
 	return nil
 }
@@ -118,6 +149,15 @@ func convertPost(ent bentry) (cerr error) {
 		content = celem.Text()
 	}
 
+	// Grab post title.
+	var title string
+	if telem := ent.elem.SelectElement("title"); telem == nil {
+		return fmt.Errorf("entry lacks title element")
+	} else {
+		title = telem.Text()
+		verb(1, "title is %q", title)
+	}
+
 	// Kick off HTML parse of content.
 	doc, err := html.Parse(strings.NewReader(content))
 	if err != nil {
@@ -126,10 +166,22 @@ func convertPost(ent bentry) (cerr error) {
 	verb(1, "converting post: %d/%d %s", ent.year, ent.month, ent.title)
 
 	// Generate head matter.
-	v := &hvisitor{}
+	v := mkhvisitor()
 	fmt.Fprintf(&v.md, "---\n")
-	fmt.Fprintf(&v.md, "title: \"%s\"\n", ent.title)
+	fmt.Fprintf(&v.md, "title: \"%s\"\n", title)
 	fmt.Fprintf(&v.md, "date: %v\n", ent.pubdate)
+	if len(ent.tags) > 0 {
+		fmt.Fprintf(&v.md, "tags: [")
+		idx := 0
+		for _, tagval := range ent.tags {
+			if idx != 0 {
+				fmt.Fprintf(&v.md, " ,")
+			}
+			idx++
+			fmt.Fprintf(&v.md, "'%s'", tagval)
+		}
+		fmt.Fprintf(&v.md, "]\n")
+	}
 	fmt.Fprintf(&v.md, "---\n\n")
 
 	// Walk tree.
@@ -175,18 +227,31 @@ func (s *state) addEntry(elem *etree.Element) error {
 		return fmt.Errorf("entry contains no publication date/time")
 	}
 
-	// collect blogger:filename and set correct slug (year, month, title fragment)
+	// collect blogger:filename and set correct slug (year, month,
+	// title fragment)
 	if bfn := elem.SelectElement("blogger:filename"); bfn != nil {
 		txt := bfn.Text()
 		verb(1, "blogger:filename: %s", txt)
 		// expected format: <blogger:filename>/2014/11/braces-off.html</blogger:filename>
-		if n, err := fmt.Sscanf(txt, "/%d/%d/%s", &b.month, &b.year, &b.title); err != nil {
+		if n, err := fmt.Sscanf(txt, "/%d/%d/%s", &b.month, &b.year, &b.urlfrag); err != nil {
 			return fmt.Errorf("unexpected blogger:filename entry %q", txt)
 		} else if n != 3 {
 			return fmt.Errorf("unexpected partial blogger:filename entry %q", txt)
 		}
 	} else {
 		return fmt.Errorf("entry contains no blogger:filename entry")
+	}
+
+	// collect post tags. we're looking for entries of the form
+	// <category scheme='tag:blogger.com,<text>' term='swimming'/>
+	//if bfn := elem.SelectElement("blogger:filename"); bfn != nil {
+	for cat := range elem.SelectElementsSeq("category") {
+		if at := cat.SelectAttr("term"); at != nil {
+			b.tags = append(b.tags, at.Value)
+		}
+	}
+	if len(b.tags) > 0 {
+		verb(1, "tags: %+v", b.tags)
 	}
 
 	s.bentries = append(s.bentries, b)
@@ -249,7 +314,7 @@ func (s *state) walkxml(root *etree.Document) error {
 		bi := &s.bentries[i]
 		bj := &s.bentries[j]
 		if bi.pubdate != bj.pubdate {
-			return bi.pubdate.Compare(bj.pubdate) < 0
+			return bj.pubdate.Compare(bi.pubdate) < 0
 		}
 		return bi.title < bj.title
 	})
@@ -305,7 +370,6 @@ func main() {
 	if err := os.Mkdir(*outdirflag, 0777); err != nil && !os.IsExist(err) {
 		log.Fatal(err)
 	}
-	s.emit()
 	if err := s.emit(); err != nil {
 		log.Fatalf("error during emit phase: %s\n", err)
 	}
