@@ -19,6 +19,56 @@ import (
 // - front matter for markdown post (title etc)
 // - augment test harness to run hugo
 
+// Thoughts on image handling:
+//
+// HTML generated for images looks something like this:
+//
+//  <div class="separator" style="clear: both; text-align: center;">
+//  <a href="URL" imageanchor="1" style="margin-left: 1em; margin-right: 1em;">
+//  <img border="0" data-original-height="1200" data-original-width="1600" height="300" src="URL" width="400">
+//  </a><
+//  /div>          /* NBL: imageanchor=1 is a non-standard attr */
+//
+// where URL is a blogger image such as
+//
+//  https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiQcGNs9bHzi2eq1eyM2wB4UNIhMlIaTlrr7lENOhUlQozHtuoKqyofWQHHkqrh30fuWWeh49KlPMqqxfohnegw5OsWLUg4uHL2pwuvcA4XjED5_Hvji1IIQTUTSCxWttYZ1_HCTB9IdGs/s400/IMG_20171123_065124.jpg
+//
+// - image file itself appears somewhere in the Takeout directory, however we
+//   can't locate strictly by name since there may be collisions
+//   or duplicates (ex: 214.jpg, which appears in a couple of distinct URLs)
+// - it should be possile to write a disambiguation phase, e.g. collect up
+//   potential duplicates in a pre-pass and then when we hit a dup, do a call to
+//   html.Get() to collect the bytes and then build an appropriate mapping
+// - would need to figure out some sort of strategy for picking new photo
+//   names so that the final namespace doesn't have any duplicates
+//
+// As a first step I could just keep the googleusercontent.com URL and
+// emit a shortcode that handles all the other stuff (alignment, width, etc).
+// shortcode parameters/inputs:
+//   - image URL
+//   - anchor style
+//   - image src
+//   - img border attr
+//   - img data-original-height, data-original-width
+//   - image width attr
+//   - image height attr
+// Q: what happens if not all attrs present?
+//
+// Thoughts about hosting: seems as though putting all the images up on flickr
+// might be the best way do go, although that requires a yearly cost of around
+// 80 bucks.
+//
+//  - note: is there a way I could arrange for a level of indirection here,
+//    e.g. link in blog is to https://wanderingsquid.org/photofwd/<HASH>
+//    which then is instantly redirected to either googleusercontent.com or
+//    flickr.com or whatever depending? Doesn't look as though this is all
+//    that easy.
+//  - alternatively I could write a tool that rewrites URL paths from
+//    one service to another within the markdown source; this could then
+//    be done if/when I need to move photos.
+//
+//
+
 var infileflag = flag.String("infile", "", "Input XML file")
 var outdirflag = flag.String("outdir", "", "Output directory for posts")
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
@@ -45,17 +95,44 @@ func readxml(path string) (*etree.Document, error) {
 	return doc, nil
 }
 
+type at struct {
+	key, val string
+}
+
+type imgdata struct {
+	ats []at
+	src string
+}
+
+type anchordata struct {
+	href  string
+	img   imgdata
+	style string
+}
+
 type hvisitor struct {
 	spanstack []string
+	ad        anchordata
 	md        strings.Builder
 	uatoms    map[atom.Atom]struct{}
 	uspanats  map[string]struct{}
+	uanchats  map[string]struct{}
 }
 
+var guatoms map[atom.Atom]struct{}
+var guspanats map[string]struct{}
+var guanchats map[string]struct{}
+
 func mkhvisitor() *hvisitor {
+	if guatoms == nil {
+		guatoms = make(map[atom.Atom]struct{})
+		guspanats = make(map[string]struct{})
+		guanchats = make(map[string]struct{})
+	}
 	return &hvisitor{
-		uatoms:   make(map[atom.Atom]struct{}),
-		uspanats: make(map[string]struct{}),
+		uatoms:   guatoms,
+		uspanats: guspanats,
+		uanchats: guanchats,
 	}
 }
 
@@ -74,6 +151,27 @@ func (hv *hvisitor) unsupportedSpanAttr(key, val string) {
 	}
 }
 
+func (hv *hvisitor) unsupportedAnchorAttr(key, val string) {
+	k := key + " -> " + val
+	if _, ok := hv.uanchats[k]; !ok {
+		verb(1, " => unsupported anchor attr ignored: %q", k)
+		hv.uanchats[k] = struct{}{}
+	}
+}
+
+func (hv *hvisitor) emitImage() error {
+	// pseudocode:
+	// + href and img.src must be set
+	// + we want the img src to be consistent with the href url
+	// + emit shortcode if not already emitted
+
+	// For now, just dump out what we've parsed.
+	verb(1, "^ completing anchor: url=%q style=%q imgsrc=%q ats=%v",
+		hv.ad.href, hv.ad.style, hv.ad.img.src, hv.ad.img.ats)
+
+	return nil
+}
+
 func (hv *hvisitor) pre(n *html.Node, level int) error {
 	verb(1, "pre: lev=%d nodetype %s atom: %v", level, n.Type, n.DataAtom)
 	switch n.Type {
@@ -83,16 +181,41 @@ func (hv *hvisitor) pre(n *html.Node, level int) error {
 		hv.md.WriteString(n.Data)
 	case html.ElementNode:
 		switch n.DataAtom {
+		case atom.A:
+			verb(1, "+ begin anchor")
+			hv.ad = anchordata{}
+			// collect anchor attributes
+			for _, a := range n.Attr {
+				switch a.Key {
+				case "href":
+					hv.ad.href = a.Val
+				case "style":
+					hv.ad.style = a.Val
+				case "imageanchor":
+					// this is a blogger-specific non-standard attr that shows up for
+					// some reason -- we can ignore it.
+				default:
+					hv.unsupportedAnchorAttr(a.Key, a.Val)
+				}
+			}
 		case atom.B:
 			hv.md.WriteString("**")
 		case atom.Br:
 			hv.md.WriteString("\n")
+		case atom.Img:
+			for _, a := range n.Attr {
+				hv.ad.img.ats = append(hv.ad.img.ats, at{key: a.Key, val: a.Val})
+				if a.Key == "src" {
+					hv.ad.img.src = a.Val
+				}
+			}
 		//case atom.Div: not supported yet
 		case atom.Span:
 			// ex: <span style="font-weight:bold;">foobar</span>
 			for _, a := range n.Attr {
 				found := false
-				if a.Key == "style" && a.Val == "font-weight:bold" {
+				if a.Key == "style" && a.Val == "font-weight:bold;" {
+					verb(1, "^^ start bold")
 					hv.md.WriteString("**")
 					found = true
 				}
@@ -100,9 +223,9 @@ func (hv *hvisitor) pre(n *html.Node, level int) error {
 					hv.unsupportedSpanAttr(a.Key, a.Val)
 				}
 			}
+		default:
+			hv.unsupportedAtom(n.DataAtom)
 		}
-	default:
-		hv.unsupportedAtom(n.DataAtom)
 	}
 	return nil
 }
@@ -111,6 +234,11 @@ func (hv *hvisitor) post(n *html.Node, level int) error {
 	verb(1, "post: lev=%d nodetype %s atom: %v", level, n.Type, n.DataAtom)
 	if n.Type == html.ElementNode {
 		switch n.DataAtom {
+		case atom.A:
+			verb(1, "+ finish anchor")
+			if err := hv.emitImage(); err != nil {
+				return err
+			}
 		case atom.B:
 			hv.md.WriteString("**")
 		case atom.Div:
@@ -118,9 +246,9 @@ func (hv *hvisitor) post(n *html.Node, level int) error {
 		case atom.Span:
 			// ex: <span style="font-weight:bold;">foobar</span>
 			for _, a := range n.Attr {
-				if a.Key == "style" && a.Val == "font-weight:bold" {
+				if a.Key == "style" && a.Val == "font-weight:bold;" {
+					verb(1, "^^ term bold")
 					hv.md.WriteString("**")
-					break
 				}
 			}
 		}
