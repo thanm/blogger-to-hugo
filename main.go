@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -32,6 +33,8 @@ import (
 // where URL is a blogger image such as
 //
 //  https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiQcGNs9bHzi2eq1eyM2wB4UNIhMlIaTlrr7lENOhUlQozHtuoKqyofWQHHkqrh30fuWWeh49KlPMqqxfohnegw5OsWLUg4uHL2pwuvcA4XjED5_Hvji1IIQTUTSCxWttYZ1_HCTB9IdGs/s400/IMG_20171123_065124.jpg
+//
+// where "s400" or "s1600" indicates resolution.
 //
 // - image file itself appears somewhere in the Takeout directory, however we
 //   can't locate strictly by name since there may be collisions
@@ -67,12 +70,30 @@ import (
 //    one service to another within the markdown source; this could then
 //    be done if/when I need to move photos.
 //
+// Revamped thoughts about images and the Takeout directory:
+// - file in Takeout are different from the ones being actually served by Blogger
+// - better to
+//
+// - write a program that finds all the images, then computes sha1 hashes
+//   for each one, writing the result to "photo-index.txt"
+// - add a mode to main.go that emits each image URL into a separate text file "urls.txt"
+// - write a new Go program that consumes "photo-index.txt" and "urls.txt";
+//   for each url U {
+//     + download the content of the image; sha1 hash the content and then look to
+//       see whether any of the files in photo-index.txt have the same hash.
+//     + trim any "(1)" type suffix from the file and then copy the file to
+//       a new dir with "<hash>_prefix.<ext>" for uniqueness
+//   }
+// - write a final file "photo-index-renamed.txt" that maps URL to renamed file
 //
 
 var infileflag = flag.String("infile", "", "Input XML file")
 var outdirflag = flag.String("outdir", "", "Output directory for posts")
+var wrphotosflag = flag.String("wrphotos", "", "Write photos URL output file")
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var entlimitflag = flag.Int("entlim", 0, "Stop after processing N entries (debugging)")
+
+const phshortcode = "hashphotourl"
 
 type bentry struct {
 	year, month int
@@ -117,22 +138,26 @@ type hvisitor struct {
 	uatoms    map[atom.Atom]struct{}
 	uspanats  map[string]struct{}
 	uanchats  map[string]struct{}
+	imurls    map[string]struct{}
 }
 
 var guatoms map[atom.Atom]struct{}
 var guspanats map[string]struct{}
 var guanchats map[string]struct{}
+var gimurls map[string]struct{}
 
 func mkhvisitor() *hvisitor {
 	if guatoms == nil {
 		guatoms = make(map[atom.Atom]struct{})
 		guspanats = make(map[string]struct{})
 		guanchats = make(map[string]struct{})
+		gimurls = make(map[string]struct{})
 	}
 	return &hvisitor{
 		uatoms:   guatoms,
 		uspanats: guspanats,
 		uanchats: guanchats,
+		imurls:   gimurls,
 	}
 }
 
@@ -162,8 +187,21 @@ func (hv *hvisitor) unsupportedAnchorAttr(key, val string) {
 func (hv *hvisitor) emitImage() error {
 	// pseudocode:
 	// + href and img.src must be set
-	// + we want the img src to be consistent with the href url
 	// + emit shortcode if not already emitted
+
+	if hv.ad.href == "" || hv.ad.img.src == "" {
+		verb(1, "@^@ disagreement between href %q and src %q, photo skipped",
+			hv.ad.href, hv.ad.img.src)
+		return nil
+	}
+	hv.imurls[hv.ad.href] = struct{}{}
+
+	// Split up the href URL into components, then pick out the last one.
+	parts := strings.Split(hv.ad.href, "/")
+	fname := parts[len(parts)-1]
+
+	// Emit a shortcode for the photo. Incomplete at the moment.
+	fmt.Fprintf(&hv.md, "{{< %s \"%s\" >}}\n", phshortcode, fname)
 
 	// For now, just dump out what we've parsed.
 	verb(1, "^ completing anchor: url=%q style=%q imgsrc=%q ats=%v",
@@ -401,6 +439,36 @@ func (s *state) emit() error {
 	for _, ent := range s.bentries {
 		if err := s.emitEntry(ent); err != nil {
 			return err
+		}
+	}
+	if len(gimurls) != 0 && *wrphotosflag != "" {
+		outf, err := os.OpenFile(*wrphotosflag, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			return fmt.Errorf("opening photos file %s: %v", *wrphotosflag, err)
+		}
+		urls := make([]string, 0, len(gimurls))
+		for k := range gimurls {
+			urls = append(urls, k)
+		}
+		sort.Strings(urls)
+		for _, v := range urls {
+			fmt.Fprintf(outf, "%s\n", v)
+		}
+		if err := outf.Close(); err != nil {
+			return fmt.Errorf("closing photos file %s: %v", *wrphotosflag, err)
+		}
+		shd := path.Join(*outdirflag, "shortcodes")
+		if shderr := os.Mkdir(shd, 0777); err != nil {
+			return fmt.Errorf("creating dir %s: %v", shd, shderr)
+		}
+		shcodepath := path.Join(*outdirflag, "shortcodes", phshortcode+".html")
+		shoutf, err2 := os.OpenFile(shcodepath, os.O_RDWR|os.O_CREATE, 0644)
+		if err2 != nil {
+			return fmt.Errorf("opening shortcodes file %s: %v", shcodepath, err2)
+		}
+		fmt.Fprintf(shoutf, "<iframe src=\"{{.Get 0}}\"></iframe>\n")
+		if err3 := shoutf.Close(); err3 != nil {
+			return fmt.Errorf("closing shortcode file %s: %v", shcodepath, err3)
 		}
 	}
 	return nil
