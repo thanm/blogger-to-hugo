@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,8 +19,19 @@ import (
 // Todo list
 // - create output filename based on slug/year/day, write text to it
 // - front matter for markdown post (title etc)
-// - augment test harness to run hugo
+// - support for tags, organize by year and month similar to blogger
+//
 
+///
+// Thoughts on anchor handling:
+// - anchors are used for regular links and for image links, these need
+//   to be handled differently.
+// - when walking the tree for an anchor we'll see the "A" node first in pre,
+//   with its attributes, then visit the text in the anchor (pre and post),
+//   then visit the "A" in post
+//   + for the text in the anchor data we want to not emit it right away,
+//     but instead buffer for later processing
+//
 // Thoughts on image handling:
 //
 // HTML generated for images looks something like this:
@@ -39,7 +51,7 @@ import (
 // - image file itself appears somewhere in the Takeout directory, however we
 //   can't locate strictly by name since there may be collisions
 //   or duplicates (ex: 214.jpg, which appears in a couple of distinct URLs)
-// - it should be possile to write a disambiguation phase, e.g. collect up
+// - it should be possible to write a disambiguation phase, e.g. collect up
 //   potential duplicates in a pre-pass and then when we hit a dup, do a call to
 //   html.Get() to collect the bytes and then build an appropriate mapping
 // - would need to figure out some sort of strategy for picking new photo
@@ -71,20 +83,11 @@ import (
 //    be done if/when I need to move photos.
 //
 // Revamped thoughts about images and the Takeout directory:
-// - file in Takeout are different from the ones being actually served by Blogger
-// - better to
-//
-// - write a program that finds all the images, then computes sha1 hashes
-//   for each one, writing the result to "photo-index.txt"
-// - add a mode to main.go that emits each image URL into a separate text file "urls.txt"
-// - write a new Go program that consumes "photo-index.txt" and "urls.txt";
-//   for each url U {
-//     + download the content of the image; sha1 hash the content and then look to
-//       see whether any of the files in photo-index.txt have the same hash.
-//     + trim any "(1)" type suffix from the file and then copy the file to
-//       a new dir with "<hash>_prefix.<ext>" for uniqueness
-//   }
-// - write a final file "photo-index-renamed.txt" that maps URL to renamed file
+// - question: is Takeout version larger or smaller?
+// - file in Takeout are different from the ones being actually served by Blogger;
+//   this means that there isn't any sort of trivial or "slam dunk" way to
+//   tell whether Blogger's "214.jpg" is the same photo as Takeout's "214.jpg", since
+//   the two will be at a different resolution with different meta-data.
 //
 
 var infileflag = flag.String("infile", "", "Input XML file")
@@ -93,7 +96,27 @@ var wrphotosflag = flag.String("wrphotos", "", "Write photos URL output file")
 var verbflag = flag.Int("v", 0, "Verbose trace output level")
 var entlimitflag = flag.Int("entlim", 0, "Stop after processing N entries (debugging)")
 
-const phshortcode = "hashphotourl"
+const usebloggerphotos = true
+
+// Shortcodes for pointing to a blogger copy of a photo
+const blphshortcode = "bloggerphoto"
+
+// Photo shortcode for flickr (not yet implemented)
+const flshortcode = "flickrphoto"
+
+const startdivshortcode = "startdiv"
+const enddivshortcode = "enddiv"
+const clearcenterdivshortcode = "clearcenterdiv"
+const clearleftdivshortcode = "clearleftdiv"
+const clearstartdivshortcode = "clearstartdiv"
+const clearnonedivshortcode = "clearnonediv"
+
+var divstyles = map[string]string{
+	"clear: both; text-align: center;": "clearcenterdiv",
+	"clear: both; text-align: start;":  "clearstartdiv",
+	"clear: both; text-align: left;":   "clearleftdiv",
+	"clear: both;":                     "clearnonediv",
+}
 
 type bentry struct {
 	year, month int
@@ -127,6 +150,7 @@ type imgdata struct {
 
 type anchordata struct {
 	href  string
+	md    strings.Builder
 	img   imgdata
 	style string
 }
@@ -184,39 +208,83 @@ func (hv *hvisitor) unsupportedAnchorAttr(key, val string) {
 	}
 }
 
+func (hv *hvisitor) emitAnchor() error {
+	if hv.ad.href == "" || hv.ad.img.src == "" {
+		// not an image -- emit as regular hyperlink.
+		fmt.Fprintf(&hv.md, " [%s](%s) ",
+			hv.ad.md.String(), hv.ad.href)
+		return nil
+	}
+	return hv.emitImage()
+}
+
 func (hv *hvisitor) emitImage() error {
 	// pseudocode:
 	// + href and img.src must be set
 	// + emit shortcode if not already emitted
-
-	if hv.ad.href == "" || hv.ad.img.src == "" {
-		verb(1, "@^@ disagreement between href %q and src %q, photo skipped",
-			hv.ad.href, hv.ad.img.src)
-		return nil
-	}
 	hv.imurls[hv.ad.href] = struct{}{}
 
 	// Split up the href URL into components, then pick out the last one.
 	parts := strings.Split(hv.ad.href, "/")
 	fname := parts[len(parts)-1]
 
-	// Emit a shortcode for the photo. Incomplete at the moment.
-	fmt.Fprintf(&hv.md, "{{< %s \"%s\" >}}\n", phshortcode, fname)
+	verb(1, "^ completing anchor: fname=%q url=%q style=%q imgsrc=%q ats=%v",
+		fname, hv.ad.href, hv.ad.style, hv.ad.img.src, hv.ad.img.ats)
 
-	// For now, just dump out what we've parsed.
-	verb(1, "^ completing anchor: url=%q style=%q imgsrc=%q ats=%v",
-		hv.ad.href, hv.ad.style, hv.ad.img.src, hv.ad.img.ats)
+	if usebloggerphotos {
+		// Shortcode parameters:
+		// s1600 - url for full sized s1600 photo
+		// s400 - url for smaller s400 photo
+		// style - style string
+		// border - image border
+		// height - height
+		// width - width
+		// data-original-height - data-original-height
+		// data-original-width - data-original-width
+		getat := func(k string) string {
+			for _, a := range hv.ad.img.ats {
+				if a.key == k {
+					return a.val
+				}
+			}
+			return ""
+		}
+
+		// Emit a shortcode for the photo. This version simply points to the
+		// original blogger photo.
+		fmt.Fprintf(&hv.md, "{{< %s s1600=\"%s\" s400=\"%s\" style=\"%s\" border=\"%s\" height=\"%s\" width=\"%s\" data-original-height=\"%s\" data-original-width=\"%s\"  >}}\n",
+			blphshortcode,
+			hv.ad.href,
+			hv.ad.img.src,
+			hv.ad.style,
+			getat("border"),
+			getat("height"),
+			getat("width"),
+			getat("data-original-height"),
+			getat("data-original-width"))
+		fmt.Fprintf(&hv.md, "\n")
+	} else {
+		// Shortcode to refer to flickr photo.
+		panic("not yet implemented")
+	}
+
+	// FIXME: issue error in case s400/s1600 not set
 
 	return nil
+
 }
 
 func (hv *hvisitor) pre(n *html.Node, level int) error {
 	verb(1, "pre: lev=%d nodetype %s atom: %v", level, n.Type, n.DataAtom)
 	switch n.Type {
 	case html.TextNode:
-		verb(1, " %q", n.Data)
 		// QQ do we need to worry about escaping here?
-		hv.md.WriteString(n.Data)
+		verb(1, "level %d textnode %q", level, n.Data)
+		if hv.ad.href != "" {
+			hv.ad.md.WriteString(n.Data)
+		} else {
+			hv.md.WriteString(n.Data)
+		}
 	case html.ElementNode:
 		switch n.DataAtom {
 		case atom.A:
@@ -247,7 +315,28 @@ func (hv *hvisitor) pre(n *html.Node, level int) error {
 					hv.ad.img.src = a.Val
 				}
 			}
-		//case atom.Div: not supported yet
+		case atom.Div:
+			// <div class="..." style="..."> stuff </div>
+			// ideally we would handle this as two shortcodes 'startdiv' and 'enddiv',
+			// but golang templating is very picky about doing style={{param}}, and
+			// refuses to allow arbitrary values. Instead pick out specific scenarios
+			// common for photos and support those.
+			dclass := ""
+			dstyle := ""
+			for _, a := range n.Attr {
+				switch a.Key {
+				case "class":
+					dclass = a.Val
+				case "style":
+					dstyle = a.Val
+				}
+			}
+			shortcodename := startdivshortcode
+			if v, ok := divstyles[dstyle]; ok {
+				shortcodename = v
+			}
+			fmt.Fprintf(&hv.md, "{{< %s class=%q style=%q >}}\n", shortcodename,
+				dclass, dstyle)
 		case atom.Span:
 			// ex: <span style="font-weight:bold;">foobar</span>
 			for _, a := range n.Attr {
@@ -274,13 +363,14 @@ func (hv *hvisitor) post(n *html.Node, level int) error {
 		switch n.DataAtom {
 		case atom.A:
 			verb(1, "+ finish anchor")
-			if err := hv.emitImage(); err != nil {
+			if err := hv.emitAnchor(); err != nil {
 				return err
 			}
+			hv.ad = anchordata{}
 		case atom.B:
 			hv.md.WriteString("**")
 		case atom.Div:
-			// not supported yet
+			fmt.Fprintf(&hv.md, "{{< %s >}}\n", enddivshortcode)
 		case atom.Span:
 			// ex: <span style="font-weight:bold;">foobar</span>
 			for _, a := range n.Attr {
@@ -299,10 +389,10 @@ func (hv *hvisitor) visitHtmlNode(n *html.Node, level int) {
 	if n.FirstChild != nil {
 		hv.visitHtmlNode(n.FirstChild, level+1)
 	}
+	hv.post(n, level)
 	if n.NextSibling != nil {
 		hv.visitHtmlNode(n.NextSibling, level)
 	}
-	hv.post(n, level)
 }
 
 func convertPost(ent bentry) (cerr error) {
@@ -334,7 +424,7 @@ func convertPost(ent bentry) (cerr error) {
 	// Generate head matter.
 	v := mkhvisitor()
 	fmt.Fprintf(&v.md, "---\n")
-	fmt.Fprintf(&v.md, "title: \"%s\"\n", title)
+	fmt.Fprintf(&v.md, "title: %s\n", strconv.Quote(title))
 	fmt.Fprintf(&v.md, "date: %v\n", ent.pubdate)
 	if len(ent.tags) > 0 {
 		fmt.Fprintf(&v.md, "tags: [")
@@ -344,7 +434,7 @@ func convertPost(ent bentry) (cerr error) {
 				fmt.Fprintf(&v.md, " ,")
 			}
 			idx++
-			fmt.Fprintf(&v.md, "'%s'", tagval)
+			fmt.Fprintf(&v.md, "%s", strconv.Quote(tagval))
 		}
 		fmt.Fprintf(&v.md, "]\n")
 	}
@@ -355,7 +445,7 @@ func convertPost(ent bentry) (cerr error) {
 
 	// Open output file.
 	fn := fmt.Sprintf("%s/post_y%d_m%d.md", *outdirflag, ent.month, ent.year)
-	outf, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE, 0644)
+	outf, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("opening %s: %v", fn, err)
 	}
@@ -435,6 +525,98 @@ func (s *state) emitEntry(ent bentry) error {
 	return nil
 }
 
+const blphotosshortcodetext = `
+{{ $s1600 := .Get "s1600" }}
+{{ $s400 := .Get "s400" }}
+{{ $style := .Get "style" | default "" }}
+{{ $border := .Get "border" | default "" }}
+{{ $height := .Get "height" | default "" }}
+{{ $width := .Get "width" | default "" }}
+{{ $doh := .Get "data-original-height" | default "" }}
+ {{ $dow := .Get "data-original-width" | default "" }}
+
+<a href= "{{ $s1600 }}"
+
+ {{ if ne $style "" }}
+   style="{{ $style }}" 
+ {{ end }}
+
+> <img 
+
+ {{ if ne $border "" }}
+   border="{{ $border }}"
+ {{ end }}
+
+ src="{{ $s400 }}"
+
+ {{ if ne $height "" }}
+   height="{{ $height }}"
+ {{ end }}
+
+ {{ if ne $width "" }}
+   width="{{ $width }}"
+ {{ end }}
+
+ {{ if ne $doh "" }}
+   data-original-height="{{ $doh }}"
+ {{ end }}
+
+ {{ if ne $dow "" }}
+   data-original-width="{{ $dow }}"
+ {{ end }}
+
+></a>
+`
+
+const startdivshortcodetext = `
+{{ $cla := .Get "class" | default "" }}
+
+<div class="{{ $cla | safeHTMLAttr }}">
+`
+
+const enddivshortcodetext = `
+</div>
+`
+
+const clearcenterdivshortcodetext = `
+{{ $cla := .Get "class" | default "" }}
+
+<div class="{{ $cla | safeHTMLAttr }}" style="clear: both; text-align: center;">
+`
+
+const clearleftdivshortcodetext = `
+{{ $cla := .Get "class" | default "" }}
+
+<div class="{{ $cla | safeHTMLAttr }}" style="clear: both; text-align: left;">
+`
+
+const clearstartdivshortcodetext = `
+{{ $cla := .Get "class" | default "" }}
+
+<div class="{{ $cla | safeHTMLAttr }}" style="clear: both; text-align: start;">
+`
+
+const clearnonedivshortcodetext = `
+{{ $cla := .Get "class" | default "" }}
+
+<div class="{{ $cla | safeHTMLAttr }}" style="clear: both;">
+`
+
+func (s *state) emitShortCode(name, text string) error {
+	shcodepath := path.Join(*outdirflag, "shortcodes", name+".html")
+	shoutf, err := os.OpenFile(shcodepath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("opening shortcodes file %s: %v", shcodepath, err)
+	}
+	fmt.Fprintf(shoutf, text)
+
+	if err := shoutf.Close(); err != nil {
+		return fmt.Errorf("closing %s: %v", shcodepath, err)
+	}
+
+	return nil
+}
+
 func (s *state) emit() error {
 	for _, ent := range s.bentries {
 		if err := s.emitEntry(ent); err != nil {
@@ -457,18 +639,23 @@ func (s *state) emit() error {
 		if err := outf.Close(); err != nil {
 			return fmt.Errorf("closing photos file %s: %v", *wrphotosflag, err)
 		}
-		shd := path.Join(*outdirflag, "shortcodes")
-		if shderr := os.Mkdir(shd, 0777); err != nil {
-			return fmt.Errorf("creating dir %s: %v", shd, shderr)
-		}
-		shcodepath := path.Join(*outdirflag, "shortcodes", phshortcode+".html")
-		shoutf, err2 := os.OpenFile(shcodepath, os.O_RDWR|os.O_CREATE, 0644)
-		if err2 != nil {
-			return fmt.Errorf("opening shortcodes file %s: %v", shcodepath, err2)
-		}
-		fmt.Fprintf(shoutf, "<iframe src=\"{{.Get 0}}\"></iframe>\n")
-		if err3 := shoutf.Close(); err3 != nil {
-			return fmt.Errorf("closing shortcode file %s: %v", shcodepath, err3)
+	}
+	shd := path.Join(*outdirflag, "shortcodes")
+	if shderr := os.Mkdir(shd, 0777); shderr != nil {
+		return fmt.Errorf("creating dir %s: %v", shd, shderr)
+	}
+	toemit := []struct{ n, t string }{
+		{blphshortcode, blphotosshortcodetext},
+		{startdivshortcode, startdivshortcodetext},
+		{enddivshortcode, enddivshortcodetext},
+		{clearnonedivshortcode, clearnonedivshortcodetext},
+		{clearleftdivshortcode, clearleftdivshortcodetext},
+		{clearstartdivshortcode, clearstartdivshortcodetext},
+		{clearcenterdivshortcode, clearcenterdivshortcodetext},
+	}
+	for _, e := range toemit {
+		if err := s.emitShortCode(e.n, e.t); err != nil {
+			return err
 		}
 	}
 	return nil
